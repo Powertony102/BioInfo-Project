@@ -12,13 +12,15 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, accuracy_score
 from sklearn.preprocessing import StandardScaler
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(ROOT_DIR, "data")
+OUT_DIR = os.path.join(ROOT_DIR, "outputs")
+
 H5AD_FILE = os.path.join(DATA_DIR, "Visium_Human_Breast_Cancer_filtered_feature_bc_matrix.h5ad")
 LR_FILE = os.path.join(DATA_DIR, "celltalk_human_lr_pair.txt")
 TRAIN_EDGES = os.path.join(DATA_DIR, "train_edges.csv")
 VAL_EDGES = os.path.join(DATA_DIR, "val_edges.csv")
 TEST_EDGES = os.path.join(DATA_DIR, "test_edges.csv")
-OUT_DIR = os.path.join(DATA_DIR, "outputs")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
