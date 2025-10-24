@@ -12,7 +12,8 @@ import anndata as ad
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, GATConv
 from sklearn.metrics import roc_auc_score, average_precision_score, f1_score, accuracy_score
 
 # Paths
@@ -148,16 +149,31 @@ def build_lr_edges_simple(X_csr: sparse.csr_matrix, lig_idx: np.ndarray, rec_idx
     return edge_index
 
 # ---------- Models ----------
-# Replace previous GraphSAGE with PyG SAGEConv version
+# Graph model that supports SAGE (default) and GAT edge attention
 class GraphSAGE(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2):
+    def __init__(self, in_dim: int, hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2,
+                 conv_type: str = 'sage', heads: int = 4, gat_concat: bool = False):
         super().__init__()
-        self.convs = nn.ModuleList()
-        self.convs.append(SAGEConv(in_dim, hidden_dim))
-        for _ in range(num_layers - 1):
-            self.convs.append(SAGEConv(hidden_dim, hidden_dim))
-        self.dropout = nn.Dropout(dropout)
+        self.conv_type = conv_type
         self.num_layers = num_layers
+        self.dropout = nn.Dropout(dropout)
+        self.convs = nn.ModuleList()
+        if conv_type == 'sage':
+            self.convs.append(SAGEConv(in_dim, hidden_dim))
+            for _ in range(num_layers - 1):
+                self.convs.append(SAGEConv(hidden_dim, hidden_dim))
+            self.embed_dim = hidden_dim
+        elif conv_type == 'gat':
+            # First layer
+            self.convs.append(GATConv(in_dim, hidden_dim, heads=heads, concat=gat_concat, dropout=dropout))
+            in_next = hidden_dim * heads if gat_concat else hidden_dim
+            # Hidden layers
+            for _ in range(num_layers - 1):
+                self.convs.append(GATConv(in_next, hidden_dim, heads=heads, concat=gat_concat, dropout=dropout))
+                in_next = hidden_dim * heads if gat_concat else hidden_dim
+            self.embed_dim = in_next
+        else:
+            raise ValueError(f"Unknown conv_type: {conv_type}")
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
         h = x
@@ -198,13 +214,14 @@ def train_gnn(node_feats: np.ndarray, edge_index_np: np.ndarray,
               val_pairs: np.ndarray, val_labels: np.ndarray,
               hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2,
               lr: float = 1e-3, weight_decay: float = 1e-4, epochs: int = 50, patience: int = 10,
-              early_stopping: bool = True):
+              early_stopping: bool = True, conv_type: str = 'sage', heads: int = 4, gat_concat: bool = False):
 
     x = torch.tensor(node_feats, dtype=torch.float32, device=device)
     edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
 
-    gnn = GraphSAGE(in_dim=node_feats.shape[1], hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout).to(device)
-    clf = PairClassifier(embed_dim=hidden_dim, dropout=dropout).to(device)
+    gnn = GraphSAGE(in_dim=node_feats.shape[1], hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout,
+                    conv_type=conv_type, heads=heads, gat_concat=gat_concat).to(device)
+    clf = PairClassifier(embed_dim=gnn.embed_dim, dropout=dropout).to(device)
 
     params = list(gnn.parameters()) + list(clf.parameters())
     opt = torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
@@ -290,6 +307,9 @@ def main():
     parser.add_argument("--lr_top_m", type=int, default=8, help="Top-M LR edges per node when enabled")
     parser.add_argument("--lr_min_strength", type=float, default=0.0, help="Min LR strength to keep an edge")
     parser.add_argument("--no_early_stopping", action="store_true", help="Disable early stopping entirely")
+    parser.add_argument("--conv", type=str, default="sage", choices=["sage","gat"], help="GNN convolution type")
+    parser.add_argument("--heads", type=int, default=4, help="GAT multi-head count")
+    parser.add_argument("--gat_concat", action="store_true", help="Concatenate heads output (else averaged)")
     args = parser.parse_args()
 
     print(f"[INFO] Args: {vars(args)}")
@@ -332,7 +352,7 @@ def main():
         val_pairs, val_labels,
         hidden_dim=args.hidden_dim, num_layers=args.num_layers, dropout=args.dropout,
         lr=args.lr, weight_decay=args.weight_decay, epochs=args.epochs, patience=args.patience,
-        early_stopping=early_stopping,
+        early_stopping=early_stopping, conv_type=args.conv, heads=args.heads, gat_concat=args.gat_concat,
     )
 
     # Validation outputs
