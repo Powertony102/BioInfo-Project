@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import argparse
 from typing import Tuple, List
 
 import numpy as np
@@ -252,13 +253,27 @@ def predict_pairs(gnn: GraphSAGE, clf: PairClassifier, node_feats: np.ndarray, A
 # ---------- Main ----------
 
 def main():
+    parser = argparse.ArgumentParser(description="Cell-Cell Interaction GNN Trainer")
+    parser.add_argument("--k", type=int, default=10, help="kNN neighbors for spatial graph")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
+    parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension for GraphSAGE")
+    parser.add_argument("--num_layers", type=int, default=2, help="Number of GraphSAGE layers")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs)")
+    parser.add_argument("--threshold", type=float, default=0.5, help="Classification threshold for predictions")
+    args = parser.parse_args()
+
+    print(f"[INFO] Args: {vars(args)}")
+
     t0 = time.time()
     adata, X_csr, coords = load_adata(H5AD_FILE)
     lig_idx, rec_idx = load_lr_gene_sets(LR_FILE, list(adata.var_names))
     node_feats = build_node_features(X_csr, coords.astype(np.float32), lig_idx, rec_idx)
 
     # Build kNN graph
-    A_csr = build_knn_adjacency(coords.astype(np.float32), k=8)
+    A_csr = build_knn_adjacency(coords.astype(np.float32), k=args.k)
 
     # Load edges
     train_df = read_edges(TRAIN_EDGES, require_label=True)
@@ -276,13 +291,13 @@ def main():
         node_feats, A_csr,
         train_pairs, train_labels,
         val_pairs, val_labels,
-        hidden_dim=128, num_layers=2, dropout=0.2,
-        lr=1e-3, weight_decay=1e-4, epochs=100, patience=10,
+        hidden_dim=args.hidden_dim, num_layers=args.num_layers, dropout=args.dropout,
+        lr=args.lr, weight_decay=args.weight_decay, epochs=args.epochs, patience=args.patience,
     )
 
     # Validation outputs
     val_scores = predict_pairs(gnn, clf, node_feats, A_csr, val_pairs)
-    val_pred = (val_scores >= 0.5).astype(int)
+    val_pred = (val_scores >= args.threshold).astype(int)
     metrics = {
         "roc_auc": float(roc_auc_score(val_labels, val_scores)),
         "aupr": float(average_precision_score(val_labels, val_scores)),
@@ -304,13 +319,13 @@ def main():
     test_scores = predict_pairs(gnn, clf, node_feats, A_csr, test_pairs)
     test_out = test_df.copy()
     test_out['score'] = test_scores
-    test_out['pred'] = (test_scores >= 0.5).astype(int)
+    test_out['pred'] = (test_scores >= args.threshold).astype(int)
     test_out_path = os.path.join(OUT_DIR, "test_predictions.csv")
     test_out.to_csv(test_out_path, index=False)
 
     # Submission format
     submission = test_df[['source', 'target']].copy()
-    submission['label'] = (test_scores >= 0.5).astype(int)
+    submission['label'] = (test_scores >= args.threshold).astype(int)
     submission_path = os.path.join(OUT_DIR, "submission.csv")
     submission.to_csv(submission_path, index=False)
     print(f"[INFO] Saved submission CSV: {submission_path}")
