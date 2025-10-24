@@ -116,31 +116,53 @@ def build_knn_adjacency(coords: np.ndarray, k: int = 8):
     return A
 
 
-def scipy_csr_to_torch_sparse(A: sparse.csr_matrix):
+def adj_to_edge_index(A: sparse.csr_matrix):
     A = A.tocoo()
-    indices = torch.tensor(np.vstack((A.row, A.col)), dtype=torch.long)
-    values = torch.tensor(A.data, dtype=torch.float32)
-    return torch.sparse_coo_tensor(indices, values, torch.Size(A.shape)).coalesce()
+    rows = A.row.astype(np.int64)
+    cols = A.col.astype(np.int64)
+    edge_index = np.vstack([rows, cols])
+    return edge_index
 
+
+def build_lr_edges_simple(X_csr: sparse.csr_matrix, lig_idx: np.ndarray, rec_idx: np.ndarray,
+                          top_m: int = 8, min_strength: float = 0.0, symmetric: bool = True):
+    # Efficient heuristic: LR strength(i,j) = sum_lig(i) * sum_rec(j)
+    n = X_csr.shape[0]
+    L_sum = np.array(X_csr[:, lig_idx].sum(axis=1)).ravel() if lig_idx.size > 0 else np.zeros(n, dtype=np.float32)
+    R_sum = np.array(X_csr[:, rec_idx].sum(axis=1)).ravel() if rec_idx.size > 0 else np.zeros(n, dtype=np.float32)
+    edges = set()
+    for i in range(n):
+        scores = L_sum[i] * R_sum
+        scores[i] = -np.inf  # no self-edge
+        if top_m < n:
+            idx = np.argpartition(-scores, top_m)[:top_m]
+        else:
+            idx = np.argsort(-scores)
+        for j in idx:
+            if scores[j] >= min_strength:
+                edges.add((i, int(j)))
+                if symmetric:
+                    edges.add((int(j), i))
+    edge_index = np.array(list(edges), dtype=np.int64).T if edges else np.empty((2,0), dtype=np.int64)
+    return edge_index
 
 # ---------- Models ----------
-
+# Replace previous GraphSAGE with PyG SAGEConv version
 class GraphSAGE(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2):
         super().__init__()
-        self.lin_in1 = nn.Linear(in_dim, hidden_dim)
-        self.lin_in2 = nn.Linear(hidden_dim, hidden_dim)
-        self.W_self = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)])
-        self.W_neigh = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)])
+        self.convs = nn.ModuleList()
+        self.convs.append(SAGEConv(in_dim, hidden_dim))
+        for _ in range(num_layers - 1):
+            self.convs.append(SAGEConv(hidden_dim, hidden_dim))
         self.dropout = nn.Dropout(dropout)
         self.num_layers = num_layers
 
-    def forward(self, x: torch.Tensor, A: torch.Tensor):
-        h = F.relu(self.lin_in1(x))
-        h = self.dropout(F.relu(self.lin_in2(h)))
-        for l in range(self.num_layers):
-            neigh = torch.sparse.mm(A, h)
-            h = F.relu(self.W_self[l](h) + self.W_neigh[l](neigh))
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        h = x
+        for conv in self.convs:
+            h = conv(h, edge_index)
+            h = F.relu(h)
             h = self.dropout(h)
         return h
 
@@ -170,14 +192,15 @@ class PairClassifier(nn.Module):
 
 # ---------- Training & Evaluation ----------
 
-def train_gnn(node_feats: np.ndarray, A_csr: sparse.csr_matrix,
+def train_gnn(node_feats: np.ndarray, edge_index_np: np.ndarray,
               train_pairs: np.ndarray, train_labels: np.ndarray,
               val_pairs: np.ndarray, val_labels: np.ndarray,
               hidden_dim: int = 128, num_layers: int = 2, dropout: float = 0.2,
-              lr: float = 1e-3, weight_decay: float = 1e-4, epochs: int = 50, patience: int = 10):
+              lr: float = 1e-3, weight_decay: float = 1e-4, epochs: int = 50, patience: int = 10,
+              early_stopping: bool = True):
 
     x = torch.tensor(node_feats, dtype=torch.float32, device=device)
-    A = scipy_csr_to_torch_sparse(A_csr).to(device)
+    edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
 
     gnn = GraphSAGE(in_dim=node_feats.shape[1], hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout).to(device)
     clf = PairClassifier(embed_dim=hidden_dim, dropout=dropout).to(device)
@@ -198,7 +221,7 @@ def train_gnn(node_feats: np.ndarray, A_csr: sparse.csr_matrix,
     for epoch in range(1, epochs + 1):
         gnn.train(); clf.train()
         opt.zero_grad()
-        h = gnn(x, A)
+        h = gnn(x, edge_index)
         logits = clf(h, train_pairs_t)
         loss = loss_fn(logits, train_labels_t)
         loss.backward()
@@ -207,7 +230,7 @@ def train_gnn(node_feats: np.ndarray, A_csr: sparse.csr_matrix,
         # Eval
         gnn.eval(); clf.eval()
         with torch.no_grad():
-            h_val = gnn(x, A)
+            h_val = gnn(x, edge_index)
             val_logits = clf(h_val, val_pairs_t)
             val_scores = torch.sigmoid(val_logits).detach().cpu().numpy()
             val_preds = (val_scores >= 0.5).astype(int)
@@ -219,18 +242,17 @@ def train_gnn(node_feats: np.ndarray, A_csr: sparse.csr_matrix,
 
         print(f"[Epoch {epoch:03d}] loss={loss.item():.4f} AUROC={auroc:.4f} AUPR={aupr:.4f} F1={f1:.4f} ACC={acc:.4f}")
 
-        # Early stopping by AUPR
         if aupr > best_aupr:
             best_aupr = aupr
             best_state = {"gnn": gnn.state_dict(), "clf": clf.state_dict()}
             wait = 0
         else:
-            wait += 1
-            if wait >= patience:
-                print(f"[INFO] Early stopping at epoch {epoch}")
-                break
+            if early_stopping:
+                wait += 1
+                if wait >= patience:
+                    print(f"[INFO] Early stopping at epoch {epoch}")
+                    break
 
-    # Load best
     if best_state is not None:
         gnn.load_state_dict(best_state["gnn"])
         clf.load_state_dict(best_state["clf"])
@@ -238,12 +260,12 @@ def train_gnn(node_feats: np.ndarray, A_csr: sparse.csr_matrix,
     return gnn, clf
 
 
-def predict_pairs(gnn: GraphSAGE, clf: PairClassifier, node_feats: np.ndarray, A_csr: sparse.csr_matrix, pairs: np.ndarray):
+def predict_pairs(gnn: GraphSAGE, clf: PairClassifier, node_feats: np.ndarray, edge_index_np: np.ndarray, pairs: np.ndarray):
     x = torch.tensor(node_feats, dtype=torch.float32, device=device)
-    A = scipy_csr_to_torch_sparse(A_csr).to(device)
+    edge_index = torch.tensor(edge_index_np, dtype=torch.long, device=device)
     gnn.eval(); clf.eval()
     with torch.no_grad():
-        h = gnn(x, A)
+        h = gnn(x, edge_index)
         pairs_t = torch.tensor(pairs, dtype=torch.long, device=device)
         logits = clf(h, pairs_t)
         scores = torch.sigmoid(logits).cpu().numpy()
@@ -263,6 +285,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay")
     parser.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs)")
     parser.add_argument("--threshold", type=float, default=0.5, help="Classification threshold for predictions")
+    parser.add_argument("--use_lr_edges", action="store_true", help="Augment graph with LR-induced edges")
+    parser.add_argument("--lr_top_m", type=int, default=8, help="Top-M LR edges per node when enabled")
+    parser.add_argument("--lr_min_strength", type=float, default=0.0, help="Min LR strength to keep an edge")
+    parser.add_argument("--no_early_stopping", action="store_true", help="Disable early stopping entirely")
     args = parser.parse_args()
 
     print(f"[INFO] Args: {vars(args)}")
@@ -272,8 +298,18 @@ def main():
     lig_idx, rec_idx = load_lr_gene_sets(LR_FILE, list(adata.var_names))
     node_feats = build_node_features(X_csr, coords.astype(np.float32), lig_idx, rec_idx)
 
-    # Build kNN graph
+    # Build kNN graph and optional LR edges
     A_csr = build_knn_adjacency(coords.astype(np.float32), k=args.k)
+    edge_index_knn = adj_to_edge_index(A_csr)
+
+    if args.use_lr_edges:
+        edge_index_lr = build_lr_edges_simple(X_csr, lig_idx, rec_idx, top_m=args.lr_top_m, min_strength=args.lr_min_strength, symmetric=True)
+        # Merge edges
+        edges_set = set(map(tuple, edge_index_knn.T))
+        edges_set.update(map(tuple, edge_index_lr.T))
+        edge_index = np.array(list(edges_set), dtype=np.int64).T if edges_set else edge_index_knn
+    else:
+        edge_index = edge_index_knn
 
     # Load edges
     train_df = read_edges(TRAIN_EDGES, require_label=True)
@@ -286,17 +322,20 @@ def main():
     val_labels = val_df['label'].values.astype(np.int64)
     test_pairs = test_df[['source', 'target']].values.astype(np.int64)
 
+    early_stopping = not args.no_early_stopping
+
     # Train
     gnn, clf = train_gnn(
-        node_feats, A_csr,
+        node_feats, edge_index,
         train_pairs, train_labels,
         val_pairs, val_labels,
         hidden_dim=args.hidden_dim, num_layers=args.num_layers, dropout=args.dropout,
         lr=args.lr, weight_decay=args.weight_decay, epochs=args.epochs, patience=args.patience,
+        early_stopping=early_stopping,
     )
 
     # Validation outputs
-    val_scores = predict_pairs(gnn, clf, node_feats, A_csr, val_pairs)
+    val_scores = predict_pairs(gnn, clf, node_feats, edge_index, val_pairs)
     val_pred = (val_scores >= args.threshold).astype(int)
     metrics = {
         "roc_auc": float(roc_auc_score(val_labels, val_scores)),
@@ -316,7 +355,7 @@ def main():
         json.dump(metrics, f, indent=2)
 
     # Test outputs
-    test_scores = predict_pairs(gnn, clf, node_feats, A_csr, test_pairs)
+    test_scores = predict_pairs(gnn, clf, node_feats, edge_index, test_pairs)
     test_out = test_df.copy()
     test_out['score'] = test_scores
     test_out['pred'] = (test_scores >= args.threshold).astype(int)
