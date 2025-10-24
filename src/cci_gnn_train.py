@@ -277,7 +277,7 @@ def main():
         train_pairs, train_labels,
         val_pairs, val_labels,
         hidden_dim=128, num_layers=2, dropout=0.2,
-        lr=1e-3, weight_decay=1e-4, epochs=60, patience=10,
+        lr=1e-3, weight_decay=1e-4, epochs=100, patience=10,
     )
 
     # Validation outputs
