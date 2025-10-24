@@ -101,6 +101,26 @@ def build_edge_attr(edge_index: np.ndarray, coords: np.ndarray, L_sum: np.ndarra
     m = F.mean(axis=0, keepdims=True); sd = F.std(axis=0, keepdims=True) + 1e-6
     return (F - m) / sd
 
+def check_trans_inputs_numpy(edge_index: np.ndarray, edge_attr: np.ndarray, name: str = "TransEncoder"):
+    assert edge_index.shape[0] == 2, f"{name}: edge_index shape must be [2, E], got {edge_index.shape}"
+    assert edge_attr.ndim == 2, f"{name}: edge_attr must be 2D, got {edge_attr.shape}"
+    assert edge_attr.shape[0] == edge_index.shape[1], f"{name}: edge_attr rows ({edge_attr.shape[0]}) != #edges ({edge_index.shape[1]})"
+    assert edge_attr.shape[1] in (2,), f"{name}: expected edge_attr dim=2, got {edge_attr.shape[1]}"
+
+
+def build_degrees(n_nodes: int, edge_index: np.ndarray):
+    deg = np.bincount(edge_index[0], minlength=n_nodes)
+    return deg.astype(np.int64)
+
+def gating_features(pairs: np.ndarray, coords: np.ndarray, L_sum: np.ndarray, R_sum: np.ndarray, deg: np.ndarray):
+    s = pairs[:,0]; t = pairs[:,1]
+    dist = np.linalg.norm(coords[s] - coords[t], axis=1)
+    lr = L_sum[s] * R_sum[t]
+    ds, dt = deg[s], deg[t]
+    Fp = np.stack([dist, lr, ds, dt], axis=1).astype(np.float32)
+    m = Fp.mean(axis=0, keepdims=True); sd = Fp.std(axis=0, keepdims=True) + 1e-6
+    return (Fp - m) / sd
+
 # ---------- Experts ----------
 
 class SAGEEncoder(nn.Module):
@@ -132,16 +152,22 @@ class GATEncoder(nn.Module):
         return h
 
 class TransEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dim=128, num_layers=2, heads=4, dropout=0.2, concat=False):
+    def __init__(self, in_dim, hidden_dim=128, num_layers=2, heads=4, dropout=0.2, concat=False, edge_dim=2):
         super().__init__()
-        self.convs = nn.ModuleList([TransformerConv(in_dim, hidden_dim, heads=heads, concat=concat, dropout=dropout)])
+        self.edge_dim = edge_dim
+        self.convs = nn.ModuleList([TransformerConv(in_dim, hidden_dim, heads=heads, concat=concat, dropout=dropout, edge_dim=edge_dim)])
         in_next = hidden_dim * heads if concat else hidden_dim
         for _ in range(num_layers-1):
-            self.convs.append(TransformerConv(in_next, hidden_dim, heads=heads, concat=concat, dropout=dropout))
+            self.convs.append(TransformerConv(in_next, hidden_dim, heads=heads, concat=concat, dropout=dropout, edge_dim=edge_dim))
             in_next = hidden_dim * heads if concat else hidden_dim
         self.dropout = nn.Dropout(dropout)
         self.embed_dim = in_next
     def forward(self, x, edge_index, edge_attr):
+        # shape checks for TransformerConv inputs
+        assert edge_index.dim() == 2 and edge_index.size(0) == 2, f"edge_index must be [2, E], got {tuple(edge_index.size())}"
+        assert edge_attr.dim() == 2, f"edge_attr must be [E, edge_dim], got {tuple(edge_attr.size())}"
+        assert edge_attr.size(0) == edge_index.size(1), f"edge_attr rows ({edge_attr.size(0)}) must equal #edges ({edge_index.size(1)})"
+        assert edge_attr.size(1) == self.edge_dim, f"edge_attr dim ({edge_attr.size(1)}) must equal configured edge_dim ({self.edge_dim})"
         h = x
         for conv in self.convs:
             h = F.relu(conv(h, edge_index, edge_attr)); h = self.dropout(h)
@@ -204,19 +230,21 @@ def train_moe(node_feats, coords, X_csr, lig_idx, rec_idx, edge_index_knn, edge_
     edge_attr_comb = build_edge_attr(edge_index_comb, coords, L_sum, R_sum)
     edge_attr_lr = build_edge_attr(edge_index_lr, coords, L_sum, R_sum) if edge_index_lr.size else np.zeros((0,2), dtype=np.float32)
     deg_comb = build_degrees(n, edge_index_comb)
-
-    # Build models (independent encoders)
-    x = torch.tensor(node_feats, dtype=torch.float32, device=device)
-    ei_knn = torch.tensor(edge_index_knn, dtype=torch.long, device=device)
-    ei_lr = torch.tensor(edge_index_lr, dtype=torch.long, device=device)
-    ei_comb = torch.tensor(edge_index_comb, dtype=torch.long, device=device)
-    ea_comb = torch.tensor(edge_attr_comb, dtype=torch.float32, device=device)
-    ea_lr = torch.tensor(edge_attr_lr, dtype=torch.float32, device=device)
-
-    expA = SAGEEncoder(x.shape[1], hidden_dim, num_layers, dropout).to(device)
-    expB = GATEncoder(x.shape[1], hidden_dim, num_layers, heads, dropout, concat=False).to(device)
-    expC = TransEncoder(x.shape[1], hidden_dim, num_layers, heads, dropout, concat=False).to(device)
-    expD = SAGEEncoder(x.shape[1], hidden_dim, num_layers, dropout).to(device)
+    # numpy-level shape checks for TransformerConv
+    check_trans_inputs_numpy(edge_index_comb, edge_attr_comb, name="TransEncoder-Comb")
+ 
+     # Build models (independent encoders)
+     x = torch.tensor(node_feats, dtype=torch.float32, device=device)
+     ei_knn = torch.tensor(edge_index_knn, dtype=torch.long, device=device)
+     ei_lr = torch.tensor(edge_index_lr, dtype=torch.long, device=device)
+     ei_comb = torch.tensor(edge_index_comb, dtype=torch.long, device=device)
+     ea_comb = torch.tensor(edge_attr_comb, dtype=torch.float32, device=device)
+     ea_lr = torch.tensor(edge_attr_lr, dtype=torch.float32, device=device)
+ 
+     expA = SAGEEncoder(x.shape[1], hidden_dim, num_layers, dropout).to(device)
+     expB = GATEncoder(x.shape[1], hidden_dim, num_layers, heads, dropout, concat=False).to(device)
+    expC = TransEncoder(x.shape[1], hidden_dim, num_layers, heads, dropout, concat=False, edge_dim=edge_attr_comb.shape[1]).to(device)
+     expD = SAGEEncoder(x.shape[1], hidden_dim, num_layers, dropout).to(device)
 
     clfA = PairClassifier(expA.embed_dim, dropout).to(device)
     clfB = PairClassifier(expB.embed_dim, dropout).to(device)
